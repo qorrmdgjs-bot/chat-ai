@@ -241,7 +241,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 #app{display:flex;flex-direction:column;height:100vh;height:100dvh}
 header{
   display:flex;align-items:center;gap:8px;
-  padding:10px 16px;background:var(--surface);
+  padding:10px 16px;padding-top:calc(env(safe-area-inset-top,0px) + 10px);
+  padding-left:calc(env(safe-area-inset-left,0px) + 16px);
+  padding-right:calc(env(safe-area-inset-right,0px) + 16px);
+  background:var(--surface);
   border-bottom:1px solid var(--border);
   min-height:56px;flex-shrink:0;z-index:10;
 }
@@ -337,6 +340,9 @@ header{
 
 .input-area{
   display:flex;gap:8px;padding:12px 16px;
+  padding-bottom:calc(env(safe-area-inset-bottom,0px) + 12px);
+  padding-left:calc(env(safe-area-inset-left,0px) + 16px);
+  padding-right:calc(env(safe-area-inset-right,0px) + 16px);
   border-top:1px solid var(--border);background:var(--surface);flex-shrink:0;
 }
 #input{
