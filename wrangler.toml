@@ -1,0 +1,25 @@
+name = "chat-ai"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "chat-ai-db"
+database_id = "2f101210-31eb-4e29-b617-41ea476332d9"
+
+[[kv_namespaces]]
+binding = "TOKEN_STORE"
+id = "281fa32b4bf74a29b8f8534d1cc641f6"
+
+[vars]
+AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+MAX_TOKENS = "1024"
+RECENT_MESSAGE_LIMIT = "20"
+SUMMARY_TRIGGER_COUNT = "10"
+PROFILE_TRIGGER_COUNT = "20"
+SUMMARY_WINDOW = "20"
+PROFILE_WINDOW = "50"
