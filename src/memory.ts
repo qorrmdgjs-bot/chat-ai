@@ -54,7 +54,7 @@ export async function getRecentMessages(
 ): Promise<{ role: string; content: string }[]> {
   const result = await db
     .prepare(
-      "SELECT role, content FROM messages WHERE user_id = ? AND channel = ? ORDER BY timestamp DESC LIMIT ?"
+      "SELECT role, content FROM messages WHERE user_id = ? AND channel = ? ORDER BY id DESC LIMIT ?"
     )
     .bind(userId, channel, limit)
     .all();
@@ -111,6 +111,28 @@ export async function getProfile(
   };
 }
 
+/** 마지막으로 요약을 갱신했을 때의 메시지 수 */
+export async function getSummaryCheckpoint(
+  db: D1Database, userId: string, channel: string
+): Promise<number> {
+  const row = await db
+    .prepare("SELECT message_count_at_update AS n FROM summaries WHERE user_id = ? AND channel = ?")
+    .bind(userId, channel)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/** 마지막으로 프로필을 갱신했을 때의 메시지 수 */
+export async function getProfileCheckpoint(
+  db: D1Database, userId: string, channel: string
+): Promise<number> {
+  const row = await db
+    .prepare("SELECT message_count_at_update AS n FROM profiles WHERE user_id = ? AND channel = ?")
+    .bind(userId, channel)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
 export async function updateSummary(
   db: D1Database,
   userId: string,
@@ -145,7 +167,8 @@ export async function updateProfile(
   db: D1Database,
   userId: string,
   channel: string,
-  profileData: Partial<Profile>
+  profileData: Partial<Profile>,
+  msgCount: number
 ): Promise<void> {
   const existing = await db
     .prepare(
@@ -154,15 +177,23 @@ export async function updateProfile(
     .bind(userId, channel)
     .first();
   if (existing) {
+    // 모델이 일부 필드를 빠뜨려도 기존 값을 유지한다.
+    // 예전에는 ?? null 이라 부분 JSON 하나가 프로필 전체를 지웠다.
+    const prev = await getProfile(db, userId, channel);
+    const pick = (next: string | null | undefined, before: string | null | undefined) => {
+      const v = typeof next === "string" ? next.trim() : "";
+      return v ? v : before ?? null;
+    };
     await db
       .prepare(
-        "UPDATE profiles SET work_style = ?, pain_points = ?, key_topics = ?, communication_preference = ?, updated_at = datetime('now') WHERE user_id = ? AND channel = ?"
+        "UPDATE profiles SET work_style = ?, pain_points = ?, key_topics = ?, communication_preference = ?, message_count_at_update = ?, updated_at = datetime('now') WHERE user_id = ? AND channel = ?"
       )
       .bind(
-        profileData.work_style ?? null,
-        profileData.pain_points ?? null,
-        profileData.key_topics ?? null,
-        profileData.communication_preference ?? null,
+        pick(profileData.work_style, prev?.work_style),
+        pick(profileData.pain_points, prev?.pain_points),
+        pick(profileData.key_topics, prev?.key_topics),
+        pick(profileData.communication_preference, prev?.communication_preference),
+        msgCount,
         userId,
         channel
       )
@@ -170,7 +201,7 @@ export async function updateProfile(
   } else {
     await db
       .prepare(
-        "INSERT INTO profiles (user_id, channel, work_style, pain_points, key_topics, communication_preference, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))"
+        "INSERT INTO profiles (user_id, channel, work_style, pain_points, key_topics, communication_preference, message_count_at_update, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))"
       )
       .bind(
         userId,
@@ -178,7 +209,8 @@ export async function updateProfile(
         profileData.work_style ?? null,
         profileData.pain_points ?? null,
         profileData.key_topics ?? null,
-        profileData.communication_preference ?? null
+        profileData.communication_preference ?? null,
+        msgCount
       )
       .run();
   }
@@ -225,10 +257,18 @@ export async function maybeUpdateMemory(
   const summaryTrigger = parseInt(env.SUMMARY_TRIGGER_COUNT);
   const profileTrigger = parseInt(env.PROFILE_TRIGGER_COUNT);
 
-  if (total > 0 && total % summaryTrigger === 0) {
+  // 정확히 배수일 때(total % trigger === 0)만 갱신하면, 메시지 저장이 한 번이라도
+  // 실패해 카운트가 어긋나는 순간 이후로 영원히 갱신되지 않는다.
+  // 마지막 갱신 시점 대비 누적량으로 판단한다.
+  const [summaryAt, profileAt] = await Promise.all([
+    getSummaryCheckpoint(env.DB, userId, channel),
+    getProfileCheckpoint(env.DB, userId, channel),
+  ]);
+
+  if (total > 0 && total - summaryAt >= summaryTrigger) {
     const summaryWindow = parseInt(env.SUMMARY_WINDOW);
     const msgs = await env.DB.prepare(
-      "SELECT role, content FROM messages WHERE user_id = ? AND channel = ? ORDER BY timestamp DESC LIMIT ?"
+      "SELECT role, content FROM messages WHERE user_id = ? AND channel = ? ORDER BY id DESC LIMIT ?"
     )
       .bind(userId, channel, summaryWindow)
       .all();
@@ -246,14 +286,17 @@ export async function maybeUpdateMemory(
     }
   }
 
-  if (total > 0 && total % profileTrigger === 0) {
+  if (total > 0 && total - profileAt >= profileTrigger) {
     const profileWindow = parseInt(env.PROFILE_WINDOW);
+    // 최초 N개(ASC)가 아니라 최근 N개를 본다.
+    // ASC 였을 때는 대화가 아무리 쌓여도 프로필이 첫 50개에 영원히 고정됐다.
     const msgs = await env.DB.prepare(
-      "SELECT role, content FROM messages WHERE user_id = ? AND channel = ? ORDER BY timestamp ASC LIMIT ?"
+      "SELECT role, content FROM messages WHERE user_id = ? AND channel = ? ORDER BY id DESC LIMIT ?"
     )
       .bind(userId, channel, profileWindow)
       .all();
     const conversation = ((msgs.results || []) as { role: string; content: string }[])
+      .reverse()
       .map((m) => `[${m.role.toUpperCase()}] ${m.content}`)
       .join("\n");
     const raw = await callAI(
@@ -265,7 +308,7 @@ export async function maybeUpdateMemory(
       try {
         const cleaned = raw.replace(/```json/g, "").replace(/```/g, "").trim();
         const profileData = JSON.parse(cleaned) as Partial<Profile>;
-        await updateProfile(env.DB, userId, channel, profileData);
+        await updateProfile(env.DB, userId, channel, profileData, total);
       } catch {
         // JSON 파싱 실패 시 무시
       }

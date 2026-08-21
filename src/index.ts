@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { kstDateString, kstDayName } from "./time";
 import { cors } from "hono/cors";
 import {
   saveMessage,
@@ -94,9 +95,6 @@ function hasCalendarIntent(text: string): boolean {
   return CALENDAR_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-// ─── 수정 ②: 요일 한국어 처리 ────────────────────────────────────────────
-const KO_DAYS = ["일요일", "월요일", "화요일", "수요일", "목요일", "금요일", "토요일"];
-
 function buildMessages(
   userInput: string,
   channel: string,
@@ -123,11 +121,8 @@ function buildMessages(
   }
 
   if (calendarContext) {
-    const now = new Date();
-    const dateStr = now.toLocaleDateString("ko-KR", {
-      year: "numeric", month: "long", day: "numeric", timeZone: "Asia/Seoul"
-    });
-    const dayStr = KO_DAYS[now.getDay()];
+    const dateStr = kstDateString();
+    const dayStr = kstDayName();
     contextParts.push(
       `[오늘 날짜: ${dateStr} ${dayStr}]\n[Google 캘린더 일정]\n${calendarContext}`
     );
@@ -552,6 +547,7 @@ document.querySelectorAll('.ch-btn').forEach(btn => {
     btn.classList.add('active');
     channel = btn.dataset.ch;
     clearMessages();
+    loadHistory();
     loadMemory();
     loadCalendarStatus();
     showToast(channel === 'work' ? '업무 채널로 전환' : '개인 채널로 전환');
@@ -609,9 +605,12 @@ function escapeHtml(s) {
 }
 
 function simpleMarkdown(text) {
-  return text
-    .replace(/\`\`\`([\s\S]*?)\`\`\`/g, (_, c) => '<pre><code>' + escapeHtml(c.trim()) + '</code></pre>')
-    .replace(/\`([^\`]+)\`/g, (_, c) => '<code>' + escapeHtml(c) + '</code>')
+  // 이스케이프를 가장 먼저 한 번만 수행한다.
+  // 예전에는 코드블록 안에서만 이스케이프해서, 평문의 <img onerror=...> 가
+  // innerHTML 로 그대로 실행됐다.
+  return escapeHtml(text)
+    .replace(/\`\`\`([\s\S]*?)\`\`\`/g, (_, c) => '<pre><code>' + c.trim() + '</code></pre>')
+    .replace(/\`([^\`]+)\`/g, (_, c) => '<code>' + c + '</code>')
     .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
     .replace(/\\*(.+?)\\*/g, '<em>$1</em>')
     .replace(/^#{1,3}\\s+(.+)$/gm, '<strong>$1</strong>')
@@ -620,11 +619,15 @@ function simpleMarkdown(text) {
     .split('\\n\\n').map(p => '<p>' + p.replace(/\\n/g, '<br>') + '</p>').join('');
 }
 
-function timeStr() {
-  return new Date().toLocaleTimeString('ko-KR', {hour:'2-digit', minute:'2-digit'});
+function timeStr(iso) {
+  // iso 가 없으면 현재 시각. D1 의 timestamp 는 'YYYY-MM-DD HH:MM:SS' (UTC) 형식이라
+  // 그대로 Date 에 넣으면 브라우저가 로컬시각으로 오해하므로 UTC 임을 명시한다.
+  var d = iso ? new Date(iso.replace(' ', 'T') + (/[Zz+]/.test(iso) ? '' : 'Z')) : new Date();
+  if (isNaN(d)) d = new Date();
+  return d.toLocaleTimeString('ko-KR', {hour:'2-digit', minute:'2-digit'});
 }
 
-function addMessage(role, text, streaming = false) {
+function addMessage(role, text, streaming = false, ts = null) {
   removeEmpty();
   const wrap = document.createElement('div');
   wrap.className = 'msg ' + role;
@@ -649,7 +652,7 @@ function addMessage(role, text, streaming = false) {
 
   const timeEl = document.createElement('div');
   timeEl.className = 'msg-time';
-  timeEl.textContent = timeStr();
+  timeEl.textContent = timeStr(ts);
 
   right.appendChild(bubble);
   right.appendChild(timeEl);
@@ -749,7 +752,7 @@ async function loadHistory() {
     if (!data.messages?.length) return;
     removeEmpty();
     for (const m of data.messages) {
-      addMessage(m.role, m.content);
+      addMessage(m.role, m.content, false, m.timestamp);
     }
   } catch {}
 }
@@ -896,27 +899,34 @@ app.get("/icon-512.png", (c) =>
 // POST /api/chat — 스트리밍 채팅
 app.post("/api/chat", async (c) => {
   const env = c.env;
-  const body = await c.req.json<{
-    user_input: string;
-    user_id: string;
-    channel: string;
-  }>();
+  let body: { user_input?: string; user_id?: string; channel?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "요청 형식이 올바르지 않습니다." }, 400);
+  }
 
   if (!body.user_input?.trim()) {
     return c.json({ error: "입력값이 비어있습니다." }, 400);
   }
-  if (!["work", "personal"].includes(body.channel)) {
+  if (!body.user_id?.trim()) {
+    return c.json({ error: "user_id가 필요합니다." }, 400);
+  }
+  if (!["work", "personal"].includes(body.channel as string)) {
     return c.json({ error: "채널은 'work' 또는 'personal'만 가능합니다." }, 400);
   }
 
+  const userId = body.user_id.trim();
+  const channel = body.channel as string;
+
   let calContext: string | null = null;
   if (hasCalendarIntent(body.user_input)) {
-    const connected = await isConnected(env, body.user_id);
+    const connected = await isConnected(env, userId);
     if (connected) {
       if (body.user_input.includes("이번 주") || body.user_input.includes("주간")) {
-        calContext = await getWeekEventsText(env, body.user_id);
+        calContext = await getWeekEventsText(env, userId);
       } else {
-        calContext = await getTodayEventsText(env, body.user_id);
+        calContext = await getTodayEventsText(env, userId);
       }
       if (!calContext) calContext = "(등록된 일정이 없습니다)";
     }
@@ -924,21 +934,21 @@ app.post("/api/chat", async (c) => {
 
   const limit = parseInt(env.RECENT_MESSAGE_LIMIT);
   const [recentHistory, summary, profile] = await Promise.all([
-    getRecentMessages(env.DB, body.user_id, body.channel, limit),
-    getSummary(env.DB, body.user_id, body.channel),
-    getProfile(env.DB, body.user_id, body.channel),
+    getRecentMessages(env.DB, userId, channel, limit),
+    getSummary(env.DB, userId, channel),
+    getProfile(env.DB, userId, channel),
   ]);
 
   const messages = buildMessages(
     body.user_input,
-    body.channel,
+    channel,
     recentHistory,
     summary,
     profile,
     calContext
   );
 
-  await saveMessage(env.DB, body.user_id, body.channel, "user", body.user_input);
+  await saveMessage(env.DB, userId, channel, "user", body.user_input);
 
   const aiStream = await env.AI.run(
     env.AI_MODEL as Parameters<Ai["run"]>[0],
@@ -982,8 +992,8 @@ app.post("/api/chat", async (c) => {
         controller.close();
         c.executionCtx.waitUntil(
           (async () => {
-            await saveMessage(env.DB, body.user_id, body.channel, "assistant", fullResponse);
-            await maybeUpdateMemory(env, body.user_id, body.channel);
+            await saveMessage(env.DB, userId, channel, "assistant", fullResponse);
+            await maybeUpdateMemory(env, userId, channel);
           })()
         );
       } catch (err) {
@@ -1039,7 +1049,7 @@ app.get("/api/history/:user_id", async (c) => {
   const channel = c.req.query("channel") || "work";
   const limit = parseInt(c.req.query("limit") || "20");
   const result = await c.env.DB.prepare(
-    "SELECT role, content, timestamp FROM messages WHERE user_id = ? AND channel = ? ORDER BY timestamp DESC LIMIT ?"
+    "SELECT role, content, timestamp FROM messages WHERE user_id = ? AND channel = ? ORDER BY id DESC LIMIT ?"
   ).bind(userId, channel, limit).all();
   return c.json({
     messages: ((result.results || []) as { role: string; content: string; timestamp: string }[])
@@ -1138,6 +1148,24 @@ app.delete("/api/calendar/events/:user_id/:event_id", async (c) => {
   const success = await deleteEvent(c.env, userId, eventId);
   if (!success) return c.json({ error: "일정 삭제에 실패했습니다." }, 500);
   return c.json({ message: "일정이 삭제되었습니다." });
+});
+
+// 전역 오류 핸들러
+// 예전에는 예외가 그대로 500 "Internal Server Error" 로 나가서
+// UI 에 "오류가 발생했습니다" 만 뜨고 원인을 알 수 없었다.
+app.onError((err, c) => {
+  const msg = String(err?.message ?? err);
+  console.error("unhandled:", msg);
+  if (/neuron|daily free allocation|3040|4006/i.test(msg)) {
+    return c.json(
+      { error: "오늘의 AI 사용량(무료 할당량)을 모두 썼습니다. 내일 오전 9시경 초기화됩니다." },
+      429
+    );
+  }
+  if (/rate limit|429/i.test(msg)) {
+    return c.json({ error: "요청이 몰리고 있습니다. 잠시 후 다시 시도해 주세요." }, 429);
+  }
+  return c.json({ error: "서버 오류가 발생했습니다. 잠시 후 다시 시도해 주세요." }, 500);
 });
 
 // GET /api/health

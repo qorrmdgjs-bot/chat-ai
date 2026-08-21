@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   pain_points              TEXT,
   key_topics               TEXT,
   communication_preference TEXT,
+  message_count_at_update  INTEGER DEFAULT 0,
   updated_at               TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

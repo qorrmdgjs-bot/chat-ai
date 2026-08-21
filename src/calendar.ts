@@ -1,4 +1,5 @@
 import type { Env } from "./memory";
+import { kstStartOfToday, kstStartOfDayPlus } from "./time";
 
 const SCOPES = "https://www.googleapis.com/auth/calendar";
 const AUTH_URI = "https://accounts.google.com/o/oauth2/auth";
@@ -297,16 +298,11 @@ export async function getTodayEventsText(
   env: Env,
   userId: string
 ): Promise<string | null> {
-  const now = new Date();
-  const todayStart = new Date(now);
-  todayStart.setHours(0, 0, 0, 0);
-  const todayEnd = new Date(todayStart);
-  todayEnd.setDate(todayEnd.getDate() + 1);
   const events = await listEvents(
     env,
     userId,
-    todayStart.toISOString(),
-    todayEnd.toISOString(),
+    kstStartOfToday().toISOString(),
+    kstStartOfDayPlus(1).toISOString(),
     20
   );
   if (!events || events.length === 0) return null;
@@ -325,16 +321,11 @@ export async function getWeekEventsText(
   env: Env,
   userId: string
 ): Promise<string | null> {
-  const now = new Date();
-  const todayStart = new Date(now);
-  todayStart.setHours(0, 0, 0, 0);
-  const weekEnd = new Date(todayStart);
-  weekEnd.setDate(weekEnd.getDate() + 7);
   const events = await listEvents(
     env,
     userId,
-    todayStart.toISOString(),
-    weekEnd.toISOString(),
+    kstStartOfToday().toISOString(),
+    kstStartOfDayPlus(7).toISOString(),
     30
   );
   if (!events || events.length === 0) return null;
