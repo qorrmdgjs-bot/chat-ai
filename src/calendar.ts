@@ -115,9 +115,20 @@ export async function getAccessToken(
   return token.access_token;
 }
 
+/** KV 에 토큰 레코드가 있는가 (유효성은 보지 않는다) */
+export async function hasToken(env: Env, userId: string): Promise<boolean> {
+  return (await env.TOKEN_STORE.get(tokenKey(userId))) !== null;
+}
+
+/**
+ * 실제로 캘린더를 읽을 수 있는 상태인가.
+ * 예전에는 KV 키 존재만 확인해서, 리프레시 토큰이 죽어도 "연동됨" 으로 표시되고
+ * 일정 조회는 조용히 빈 결과를 돌려줬다. 그 결과 AI 가 "오늘 일정 없습니다" 라고
+ * 단언하는 오답이 나왔다.
+ */
 export async function isConnected(env: Env, userId: string): Promise<boolean> {
-  const raw = await env.TOKEN_STORE.get(tokenKey(userId));
-  return raw !== null;
+  if (!(await hasToken(env, userId))) return false;
+  return (await getAccessToken(env, userId)) !== null;
 }
 
 export async function disconnect(env: Env, userId: string): Promise<void> {
@@ -232,7 +243,7 @@ export async function updateEvent(
   if (!accessToken) return null;
   try {
     const getRes = await fetch(
-      `${CALENDAR_API}/calendars/primary/events/${eventId}`,
+      `${CALENDAR_API}/calendars/primary/events/${encodeURIComponent(eventId)}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
     if (!getRes.ok) return null;
@@ -245,7 +256,7 @@ export async function updateEvent(
     if (updates.description !== undefined) existing.description = updates.description;
     if (updates.location !== undefined) existing.location = updates.location;
     const res = await fetch(
-      `${CALENDAR_API}/calendars/primary/events/${eventId}`,
+      `${CALENDAR_API}/calendars/primary/events/${encodeURIComponent(eventId)}`,
       {
         method: "PUT",
         headers: {
@@ -282,7 +293,7 @@ export async function deleteEvent(
   if (!accessToken) return false;
   try {
     const res = await fetch(
-      `${CALENDAR_API}/calendars/primary/events/${eventId}`,
+      `${CALENDAR_API}/calendars/primary/events/${encodeURIComponent(eventId)}`,
       {
         method: "DELETE",
         headers: { Authorization: `Bearer ${accessToken}` },
@@ -305,7 +316,8 @@ export async function getTodayEventsText(
     kstStartOfDayPlus(1).toISOString(),
     20
   );
-  if (!events || events.length === 0) return null;
+  if (events === null) return null;            // 조회 실패
+  if (events.length === 0) return "";          // 일정 없음 (실패와 구분)
   return events
     .map((e) => {
       if (e.start.includes("T")) {
@@ -328,7 +340,8 @@ export async function getWeekEventsText(
     kstStartOfDayPlus(7).toISOString(),
     30
   );
-  if (!events || events.length === 0) return null;
+  if (events === null) return null;            // 조회 실패
+  if (events.length === 0) return "";          // 일정 없음 (실패와 구분)
   const lines: string[] = [];
   let currentDate = "";
   for (const e of events) {

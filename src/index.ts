@@ -24,7 +24,46 @@ import {
 } from "./calendar";
 
 const app = new Hono<{ Bindings: Env }>();
-app.use("/*", cors());
+
+// UI 와 API 를 같은 워커가 서빙하므로 앱 자신의 요청은 동일 출처다.
+// 예전에는 cors() 기본값이라 Access-Control-Allow-Origin: * 였고,
+// 아무 웹페이지의 스크립트나 이 API 를 호출할 수 있었다.
+app.use("/*", async (c, next) => {
+  const origin = c.req.header("Origin");
+  const self = new URL(c.req.url).origin;
+  return cors({
+    origin: (o) => (!o || o === self ? o || self : ""),
+    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  })(c, next);
+});
+
+// ─── 레이트리밋 ────────────────────────────────────────────────────────────
+// 인증이 없는 공개 엔드포인트라 누구나 Workers AI 쿼터를 태울 수 있다.
+// IP 단위 시간당 상한으로 무단 사용을 억제한다.
+// (IP 를 바꿔가며 하는 공격은 막지 못한다. 근본 해결은 인증이다.)
+const RATE_LIMIT_PER_HOUR = 40;
+
+async function checkRateLimit(
+  env: Env,
+  ip: string
+): Promise<{ ok: true } | { ok: false; retryAfter: number }> {
+  const now = Date.now();
+  const bucket = Math.floor(now / 3_600_000);
+  const key = `rl:${ip}:${bucket}`;
+  let cur = 0;
+  try {
+    cur = parseInt((await env.TOKEN_STORE.get(key)) || "0", 10) || 0;
+  } catch {
+    return { ok: true }; // KV 장애 시 사용자를 막지 않는다
+  }
+  if (cur >= RATE_LIMIT_PER_HOUR) {
+    return { ok: false, retryAfter: Math.ceil(((bucket + 1) * 3_600_000 - now) / 1000) };
+  }
+  try {
+    await env.TOKEN_STORE.put(key, String(cur + 1), { expirationTtl: 7200 });
+  } catch {}
+  return { ok: true };
+}
 
 // ─── 수정 ①: 프로파일 필드명 한국어 레이블 매핑 ────────────────────────────
 const PROFILE_LABELS: Record<keyof Profile, string> = {
@@ -84,15 +123,32 @@ const SYSTEM_PROMPTS: Record<string, string> = {
 - 사용자의 일상이 더 건강하고, 풍요로워지도록 돕는 것`,
 };
 
-const CALENDAR_KEYWORDS = [
+// 읽기 의도 — 이 경우에만 캘린더를 조회해 맥락으로 넣는다
+const CALENDAR_READ_KEYWORDS = [
   "일정", "스케줄", "캘린더", "회의", "미팅", "약속",
-  "오늘 뭐", "이번 주", "내일 뭐", "몇 시에", "잡아줘",
-  "등록해", "추가해", "일정 알려", "schedule", "calendar", "meeting",
+  "오늘 뭐", "이번 주", "내일 뭐", "몇 시에", "일정 알려",
+  "schedule", "calendar", "meeting",
+];
+
+// 쓰기 의도 — 현재 채팅 경로에는 일정 생성/수정 기능이 없다.
+// 예전에는 이 단어들도 읽기 키워드에 섞여 있었고, 모델이 "등록했습니다" 라고
+// 답해도 실제로는 아무 일도 일어나지 않았다.
+const CALENDAR_WRITE_KEYWORDS = [
+  "잡아줘", "잡아 줘", "등록해", "추가해", "생성해", "만들어줘",
+  "옮겨줘", "변경해", "취소해", "삭제해",
 ];
 
 function hasCalendarIntent(text: string): boolean {
   const lower = text.toLowerCase();
-  return CALENDAR_KEYWORDS.some((kw) => lower.includes(kw));
+  return CALENDAR_READ_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+function hasCalendarWriteIntent(text: string): boolean {
+  const lower = text.toLowerCase();
+  const mentionsCalendar =
+    CALENDAR_READ_KEYWORDS.some((kw) => lower.includes(kw)) ||
+    /\d\s*시|오전|오후|내일|모레|다음\s*주/.test(lower);
+  return mentionsCalendar && CALENDAR_WRITE_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
 function buildMessages(
@@ -353,6 +409,19 @@ header{
 }
 #send-btn:hover{background:var(--primary-hover)}
 #send-btn:disabled{background:var(--border);cursor:not-allowed}
+#send-btn.stop{background:var(--danger)}
+#send-btn.stop:hover{background:#dc2626}
+
+.msg-foot{display:flex;align-items:center;gap:8px;margin-top:4px}
+.msg.user .msg-foot{flex-direction:row-reverse}
+.copy-btn{
+  border:none;background:transparent;color:var(--text3);cursor:pointer;
+  font-size:11px;padding:1px 4px;border-radius:4px;line-height:1.4;
+  opacity:0;transition:.15s;flex-shrink:0;
+}
+.msg:hover .copy-btn,.copy-btn:focus{opacity:1}
+.copy-btn:hover{color:var(--primary-light);background:var(--surface2)}
+@media(hover:none){.copy-btn{opacity:.6}}
 
 /* ── Sidebar ── */
 #sidebar{
@@ -451,7 +520,7 @@ header{
         </div>
       </div>
       <div class="input-area">
-        <textarea id="input" placeholder="메시지를 입력하세요... (Shift+Enter 줄바꿈)" rows="1"></textarea>
+        <textarea id="input" rows="1"></textarea>
         <button id="send-btn" title="전송">➤</button>
       </div>
     </div>
@@ -500,6 +569,11 @@ if (!userId) {
 let channel = 'work';
 let isStreaming = false;
 let deferredInstall = null;
+let abortCtl = null;
+
+// 모바일에는 Shift 키가 없어 Enter=전송이면 줄바꿈을 아예 못 넣는다.
+// 터치 기기에서는 Enter 를 줄바꿈으로 두고 전송은 버튼으로만 받는다.
+const isTouch = window.matchMedia('(hover:none) and (pointer:coarse)').matches;
 
 // ── PWA Install ───────────────────────────────────────────────────────────
 const installBtn = document.getElementById('install-btn');
@@ -654,8 +728,30 @@ function addMessage(role, text, streaming = false, ts = null) {
   timeEl.className = 'msg-time';
   timeEl.textContent = timeStr(ts);
 
+  const foot = document.createElement('div');
+  foot.className = 'msg-foot';
+  foot.appendChild(timeEl);
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'copy-btn';
+  copyBtn.type = 'button';
+  copyBtn.textContent = '복사';
+  copyBtn.title = '메시지 복사';
+  copyBtn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(bubble.dataset.raw || bubble.textContent);
+      copyBtn.textContent = '복사됨';
+    } catch {
+      copyBtn.textContent = '실패';
+    }
+    setTimeout(() => { copyBtn.textContent = '복사'; }, 1500);
+  });
+  foot.appendChild(copyBtn);
+
+  bubble.dataset.raw = streaming ? '' : text;
+
   right.appendChild(bubble);
-  right.appendChild(timeEl);
+  right.appendChild(foot);
   wrap.appendChild(avatar);
   wrap.appendChild(right);
   messagesEl.appendChild(wrap);
@@ -664,17 +760,22 @@ function addMessage(role, text, streaming = false, ts = null) {
 }
 
 function updateBubble(bubble, text) {
+  bubble.dataset.raw = text;
   bubble.innerHTML = simpleMarkdown(text);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 // ── Send Message ──────────────────────────────────────────────────────────
 async function sendMessage() {
+  if (isStreaming) { stopStreaming(); return; }
   const text = inputEl.value.trim();
-  if (!text || isStreaming) return;
+  if (!text) return;
 
   isStreaming = true;
-  sendBtn.disabled = true;
+  abortCtl = new AbortController();
+  sendBtn.classList.add('stop');
+  sendBtn.textContent = '■';
+  sendBtn.title = '응답 중단';
   inputEl.value = '';
   autoResize();
 
@@ -687,7 +788,8 @@ async function sendMessage() {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_input: text, user_id: userId, channel })
+      body: JSON.stringify({ user_input: text, user_id: userId, channel }),
+      signal: abortCtl.signal
     });
 
     if (!res.ok) {
@@ -723,17 +825,33 @@ async function sendMessage() {
     // 메모리 갱신 (5초 딜레이)
     setTimeout(() => loadMemory(), 5000);
   } catch (e) {
-    updateBubble(bubble, '⚠️ 네트워크 오류가 발생했습니다.');
+    if (e && e.name === 'AbortError') {
+      // 중단 시점까지 받은 내용은 남긴다.
+      updateBubble(bubble, fullText ? fullText + '\\n\\n_(중단됨)_' : '_(중단됨)_');
+    } else {
+      updateBubble(bubble, '⚠️ 네트워크 오류가 발생했습니다.');
+    }
   } finally {
     isStreaming = false;
-    sendBtn.disabled = false;
-    inputEl.focus();
+    abortCtl = null;
+    sendBtn.classList.remove('stop');
+    sendBtn.textContent = '\u27a4';
+    sendBtn.title = '전송';
+    if (!isTouch) inputEl.focus();
   }
+}
+
+function stopStreaming() {
+  if (abortCtl) abortCtl.abort();
 }
 
 sendBtn.addEventListener('click', sendMessage);
 inputEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  if (e.key !== 'Enter') return;
+  if (isTouch) return;                       // 모바일: Enter 는 줄바꿈, 전송은 버튼으로
+  if (e.shiftKey || e.isComposing) return;   // 한글 조합 중 Enter 로 오전송되는 것도 막는다
+  e.preventDefault();
+  sendMessage();
 });
 
 // ── Auto Resize ───────────────────────────────────────────────────────────
@@ -849,6 +967,10 @@ clearBtn.addEventListener('click', async () => {
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────
+inputEl.placeholder = isTouch
+  ? '메시지를 입력하세요... (전송은 ➤ 버튼)'
+  : '메시지를 입력하세요... (Shift+Enter 줄바꿈)';
+
 loadHistory();
 loadMemory();
 loadCalendarStatus();
@@ -919,17 +1041,42 @@ app.post("/api/chat", async (c) => {
   const userId = body.user_id.trim();
   const channel = body.channel as string;
 
+  const ip = c.req.header("CF-Connecting-IP") || "unknown";
+  const rl = await checkRateLimit(env, ip);
+  if (!rl.ok) {
+    return c.json(
+      { error: `요청이 너무 많습니다. ${Math.ceil(rl.retryAfter / 60)}분 후 다시 시도해 주세요.` },
+      429,
+      { "Retry-After": String(rl.retryAfter) }
+    );
+  }
+
   let calContext: string | null = null;
   if (hasCalendarIntent(body.user_input)) {
-    const connected = await isConnected(env, userId);
-    if (connected) {
-      if (body.user_input.includes("이번 주") || body.user_input.includes("주간")) {
-        calContext = await getWeekEventsText(env, userId);
-      } else {
-        calContext = await getTodayEventsText(env, userId);
-      }
-      if (!calContext) calContext = "(등록된 일정이 없습니다)";
+    if (await isConnected(env, userId)) {
+      const wantsWeek =
+        body.user_input.includes("이번 주") || body.user_input.includes("주간");
+      const text = wantsWeek
+        ? await getWeekEventsText(env, userId)
+        : await getTodayEventsText(env, userId);
+      // null = 조회 실패, "" = 일정 없음. 둘을 구분해야 AI 가 단언하지 않는다.
+      calContext =
+        text === null
+          ? "(캘린더를 불러오지 못했습니다. 일정이 없다고 단정하지 말고, 연동 상태를 확인해 보라고 안내하라)"
+          : text === ""
+          ? "(해당 기간에 등록된 일정이 없습니다)"
+          : text;
+    } else {
+      calContext =
+        "(Google 캘린더가 연동되어 있지 않다. 일정을 아는 것처럼 답하지 말고, 사이드바에서 연동할 수 있다고 안내하라)";
     }
+  }
+
+  if (hasCalendarWriteIntent(body.user_input)) {
+    const notice =
+      "(중요: 너는 일정을 등록·수정·삭제할 수 없다. 등록했다고 말하지 마라. " +
+      "대신 사용자가 직접 등록할 수 있도록 제목·날짜·시간을 정리해서 제시하라)";
+    calContext = calContext ? calContext + "\n" + notice : notice;
   }
 
   const limit = parseInt(env.RECENT_MESSAGE_LIMIT);
